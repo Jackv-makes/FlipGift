@@ -13,7 +13,7 @@ The Flipper's own IR port can't talk to a Game Boy, it only understands TV remot
 - Open source, so do whatever you want with it
 
 # Disclaimer
-I am not a professional embedded developer, this is a hobby project and there are probably rough edges. IR is fussy about alignment, so expect to fiddle with it, and I can't promise to debug your setup. Keep in mind the game only hands out five gifts a day and one per trainer, so if the Pokemon Center refuses you it's probably that and not the IR. If you see something you'd do better, feel free to fork the repo.
+I am not a professional embedded developer, this is a hobby project and there are probably rough edges. IR is fussy about alignment, so expect to fiddle with it, and I can't promise to debug your setup. I used AI to assist with cleaning up my code and some documentation. Keep in mind the game only hands out five gifts a day and one per trainer, so if the Pokemon Center refuses you it's probably that and not the IR. If you see something you'd do better, feel free to fork the repo.
 
 # Hardware
 You need the [FlippIR board](https://github.com/Jackv-makes/FlippIR-hardware) on the GPIO header, nothing else. No hardware files are provided here.
