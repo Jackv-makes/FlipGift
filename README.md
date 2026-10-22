@@ -1,5 +1,5 @@
-# Flipgift
-Flipgift sends a Gen II Pokemon Mystery Gift(Gold, Silver or Crystal) from a Flipper Zero to a real Game Boy Color cartridge over IR, the same way two Game Boys would do it, and shows you the trainer and gift the cart sends back. It runs on the [FlippIR board](https://github.com/Jackv-makes/FlippIR-hardware), the little IR add-on I made for the Flipper. My Pokewalker port, Flipwalker, uses the same board, so if you already have one plugged in you have everything you need. The reason I made this is that I had a drawer of Gen II carts, the board was already on my Flipper, and I wanted to see if it could do Game Boy IR too.
+# FlipGift
+FlipGift sends a Gen II Pokemon Mystery Gift(Gold, Silver or Crystal) from a Flipper Zero to a real Game Boy Color cartridge over IR, the same way two Game Boys would do it, and shows you the trainer and gift the cart sends back. It runs on the [FlippIR board](https://github.com/Jackv-makes/FlippIR-hardware), the little IR add-on I made for the Flipper. My Pokewalker port, Flipwalker, uses the same board, so if you already have one plugged in you have everything you need. The reason I made this is that I had a drawer of Gen II carts, the board was already on my Flipper, and I wanted to see if it could do Game Boy IR too.
 
 It can. I've tested it against a retail US Pokemon Gold cartridge, the game accepts the gift and the app shows what the cart offered back. It builds for the official firmware 1.5.1 and runs on my Flipper.
 
@@ -29,7 +29,7 @@ ufbt update --channel=release
 ufbt
 ```
 
-That gives you `dist/flipgift.fap`. Copy it to `apps/GPIO` on the SD card, or plug the Flipper in and run `ufbt launch` to install and start it(close qFlipper first, it holds the serial port). It shows up under Apps, GPIO, as Flipgift.
+That gives you `dist/FlipGift.fap`. Copy it to `apps/GPIO` on the SD card, or plug the Flipper in and run `ufbt launch` to install and start it(close qFlipper first, it holds the serial port). It shows up under Apps, GPIO, as FlipGift.
 
 # Menus
 - **Send Gift** is where you pick Item, Deco or Random, choose the item or decoration, and send. Random mode picks a new item, trainer name and ID every time, which gets around the one gift per trainer per day rule, and hides what the gift is until you pick it up at the Pokemon Center.
@@ -40,7 +40,7 @@ That gives you `dist/flipgift.fap`. Copy it to `apps/GPIO` on the SD card, or pl
 There's a recording of the menus in [docs/app-walkthrough.gif](docs/app-walkthrough.gif).
 
 # First Use
-1. Plug the FlippIR board in, open Flipgift, pick a gift.
+1. Plug the FlippIR board in, open FlipGift, pick a gift.
 2. On the Game Boy open Mystery Gift from the title screen so it says "Press A to link".
 3. Hold the board a few centimetres from the Game Boy's IR window, square on, press Send gift on the Flipper and then A on the game, once.
 4. Watch the screen. It tells you when it hears the game, when to hold still, and when the gift is in.
@@ -51,7 +51,7 @@ If it fails it says so and tries again on its own. The game goes back to its Pre
 - Five gifts a day and one per trainer are game limits. Random mode gets around the per trainer one but not the daily cap.
 - Range is a few centimetres, about what two Game Boys manage. A dim room helps, bright or fluorescent light makes it worse.
 - The original app was tested against French Crystal and Gold carts and this one against a US Gold cart. Silver and other regions should work but I haven't tried them.
-- If something isn't working, every attempt saves a log to `apps_data/flipgift/last_trace.txt` on the SD card.
+- If something isn't working, every attempt saves a log to `apps_data/FlipGift/last_trace.txt` on the SD card.
 
 # Credit and Thanks
 This started as a fork of [TheRealNox's flipper-pokemon-mystery-gift](https://github.com/TheRealNox/flipper-pokemon-mystery-gift). The actual Mystery Gift protocol code is theirs. None of this would exist without that work. What I added is decorations, showing what the cart sends back, the aim and retry flow, and everything that makes it work through the FlippIR board.
