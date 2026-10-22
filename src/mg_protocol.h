@@ -36,7 +36,16 @@ typedef struct {
     MgLog log;
     void* log_ctx;
     volatile bool* abort; // set *abort=true to cancel mid-exchange (may be NULL)
+    // Optional capture of what the cart sends back during the exchange: its
+    // payload 1 (partner data) and payload 2 (party). Buffers of MG_CAPTURE_CAP
+    // bytes; lengths are written on success. Any of these may be NULL.
+    uint8_t* partner1;
+    uint8_t* partner1_len;
+    uint8_t* partner2;
+    uint8_t* partner2_len;
 } MgProtocol;
+
+#define MG_CAPTURE_CAP 64
 
 const char* mg_result_str(MgResult r);
 

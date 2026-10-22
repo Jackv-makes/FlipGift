@@ -134,3 +134,74 @@ uint8_t mg_gift_build_payload2(uint8_t* buf, const MgPartyMon* mons, uint8_t cou
 
 /** Convenience: a default item gift. */
 MgGiftInfo mg_gift_default_item(const char* trainer_name, uint16_t tid, uint8_t item_index);
+
+/**
+ * Indices into the game's MysteryGiftDecos table
+ * (data/decorations/mystery_gift_decos.asm). With sent_deco = 1 the cart
+ * gives this decoration, or falls back to which_item if it already owns it.
+ */
+typedef enum {
+    MG_DECO_JIGGLYPUFF_DOLL = 0,
+    MG_DECO_POLIWAG_DOLL,
+    MG_DECO_DIGLETT_DOLL,
+    MG_DECO_STARYU_DOLL,
+    MG_DECO_MAGIKARP_DOLL,
+    MG_DECO_ODDISH_DOLL,
+    MG_DECO_GENGAR_DOLL,
+    MG_DECO_SHELLDER_DOLL,
+    MG_DECO_GRIMER_DOLL,
+    MG_DECO_VOLTORB_DOLL,
+    MG_DECO_CLEFAIRY_POSTER,
+    MG_DECO_JIGGLYPUFF_POSTER,
+    MG_DECO_SNES,
+    MG_DECO_WEEDLE_DOLL,
+    MG_DECO_GEODUDE_DOLL,
+    MG_DECO_MACHOP_DOLL,
+    MG_DECO_MAGNAPLANT,
+    MG_DECO_TROPICPLANT,
+    MG_DECO_FAMICOM,
+    MG_DECO_N64,
+    MG_DECO_BULBASAUR_DOLL,
+    MG_DECO_SQUIRTLE_DOLL,
+    MG_DECO_PINK_BED,
+    MG_DECO_POLKADOT_BED,
+    MG_DECO_RED_CARPET,
+    MG_DECO_BLUE_CARPET,
+    MG_DECO_YELLOW_CARPET,
+    MG_DECO_GREEN_CARPET,
+    MG_DECO_JUMBOPLANT,
+    MG_DECO_VIRTUAL_BOY,
+    MG_DECO_BIG_ONIX_DOLL,
+    MG_DECO_PIKACHU_POSTER,
+    MG_DECO_BIG_LAPRAS_DOLL,
+    MG_DECO_SURF_PIKACHU_DOLL,
+    MG_DECO_PIKACHU_BED,
+    MG_DECO_UNOWN_DOLL,
+    MG_DECO_TENTACOOL_DOLL,
+    MG_DECO_COUNT,
+} MgGiftDecoIndex;
+
+/** Human-readable name for a MysteryGiftDecos index. */
+const char* mg_deco_name(uint8_t index);
+
+/** Convert one Gen II text code to ASCII ('?' for anything unmapped). */
+char mg_gen2_to_ascii(uint8_t code);
+
+/** What the partner cart told us about itself (decoded payload 1). */
+typedef struct {
+    uint8_t version;
+    uint16_t trainer_id;
+    char trainer_name[P1_NAME_LEN + 1]; // ASCII, NUL-terminated
+    uint8_t pokedex_count;
+    uint8_t sent_deco;
+    uint8_t which_item;
+    uint8_t which_deco;
+    uint8_t backup_item;
+    uint8_t counter;
+} MgPartnerInfo;
+
+/** Decode payload 1. @return false if len < MG_PAYLOAD1_LEN. */
+bool mg_gift_parse_payload1(const uint8_t* buf, uint8_t len, MgPartnerInfo* out);
+
+/** Decode payload 2 into up to MG_PARTY_MAX mons. @return number of mons. */
+uint8_t mg_gift_parse_payload2(const uint8_t* buf, uint8_t len, MgPartyMon* out);

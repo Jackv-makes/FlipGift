@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Nicolas Aubry
+// Copyright (C) 2026 Nicolas Aubry (original protocol port)
+// Copyright (C) 2026 @Jackv_makes (edge-pulse receiver for the TFBS4711)
 
 #include "mg_protocol.h"
 #include "mg_timing.h"
 
 #include <furi.h>
+#include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
 
@@ -28,6 +30,7 @@ typedef enum {
     TrAckTx, // v1 = status byte sent
     TrTimeout, // aux = where (see tr_where_names), v1/v2 = context
     TrDone, // v1 = MgResult
+    TrEdge, // edge receivers: aux 1 = dead-time reject, 2 = non-bit period; v1 = us
 } MgTraceTag;
 
 // TrTimeout `where` codes
@@ -73,7 +76,7 @@ typedef struct {
     uint16_t v2;
 } MgTraceEv;
 
-#define MG_TRACE_CAP 512
+#define MG_TRACE_CAP 1024
 static MgTraceEv g_trace[MG_TRACE_CAP];
 static volatile uint16_t g_trace_n = 0;
 static volatile bool g_trace_ovf = false;
@@ -129,6 +132,9 @@ bool mg_trace_format(uint16_t i, char* buf, size_t buf_size) {
         snprintf(buf, buf_size, "%lu.%ums rx-hello m1=%u gap=%u", ms, frac, e->v1, e->v2);
         break;
     case TrPulse: snprintf(buf, buf_size, "%lu.%ums p m=%u s=%u", ms, frac, e->v1, e->v2); break;
+    case TrEdge:
+        snprintf(buf, buf_size, "%lu.%ums edge %s %u", ms, frac, e->aux == 1 ? "dead" : "period", e->v1);
+        break;
     case TrSyncOk: snprintf(buf, buf_size, "%lu.%ums sync s=%u", ms, frac, e->v2); break;
     case TrMsgTx: snprintf(buf, buf_size, "%lu.%ums tx-msg len=%u", ms, frac, e->aux); break;
     case TrMsgRx: snprintf(buf, buf_size, "%lu.%ums rx-msg cap=%u", ms, frac, e->aux); break;
@@ -221,53 +227,69 @@ void mg_tx_hello(void) {
 }
 
 // -------------------------------------------------------------------------
-// RX core: faithful port of the reference read_ir() edge classifier.
-// Persistent line state across calls; every edge yields one classified period.
+// RX core. The reference read_ir() classified mark and dark widths from a
+// level-tracking receiver. The TFBS4711 instead emits one fixed ~2 us pulse
+// per rising light edge, so everything here is decoded from the PERIOD
+// between leading edges: that period is the previous mark plus its space.
+// Each leading edge yields a dark classification (the period) followed, on
+// the next call, by an instant mark event, so the caller's mark/dark rhythm
+// is unchanged and nothing depends on catching the 2 us pulse's end.
 // Out-of-range periods (incl. the huge dark after our own TX) classify as
 // IrNone and are skipped by the scan loops -- self-healing, no quiet guard.
 // -------------------------------------------------------------------------
 typedef enum {
     IrNone = 0, // junk / timeout
-    IrLongUp, // mark >= 90 us: hello/preamble/postamble
-    IrBitUp, // mark 40-90 us: data bit
-    IrBit0Down, // dark 40-170 us
-    IrBit1Down, // dark 170-420 us
-    IrHelloDown, // dark 420-680 us (hello gap; also GBC preamble space)
-    IrBeginDown, // dark 680-1400 us (forum-spec preamble space)
+    IrBitUp, // a pulse (mark); its length says nothing
+    IrBit0Down, // period < MG_EDGE_BIT0_DARK_MAX_US
+    IrBit1Down, // period < MG_EDGE_BIT1_DARK_MAX_US
+    IrHelloDown, // period < MG_EDGE_HELLO_DARK_MAX_US (hello gap, postamble->next)
+    IrBeginDown, // period up to MG_RX_DARK_MAX_US (preamble)
 } MgIr;
 
 static bool g_last_mark;
 static uint32_t g_last_edge;
+static MgIr g_edge_pending = IrNone; // queued mark event
+static uint32_t g_last_lead; // last accepted leading edge
 
 static void mg_ir_reset(void) {
     g_last_mark = gbc_ir_rx_is_mark();
     g_last_edge = gbc_ir_time_us();
+    g_last_lead = g_last_edge;
+    g_edge_pending = IrNone;
 }
 
 static MgIr mg_read_ir(uint32_t wait_us, uint32_t* width) {
-    uint32_t start = gbc_ir_time_us();
     if(width) *width = 0;
+    if(g_edge_pending != IrNone) {
+        MgIr v = g_edge_pending;
+        g_edge_pending = IrNone;
+        if(width) *width = 2;
+        return v;
+    }
+    uint32_t start = gbc_ir_time_us();
     for(;;) {
         bool m = gbc_ir_rx_is_mark();
         if(m != g_last_mark) {
             uint32_t now = gbc_ir_time_us();
-            uint32_t d = now - g_last_edge;
             g_last_mark = m;
             g_last_edge = now;
-            if(width) *width = d;
             if(m) {
-                // Light just started: d was the DARK duration.
-                if(d < MG_RX_DARK_MIN_US || d > MG_RX_DARK_MAX_US) return IrNone;
-                if(d < MG_RX_BIT0_DARK_MAX_US) return IrBit0Down;
-                if(d < MG_RX_BIT1_DARK_MAX_US) return IrBit1Down;
-                if(d < MG_RX_HELLO_DARK_MAX_US) return IrHelloDown;
+                uint32_t d = now - g_last_lead;
+                if(d < MG_EDGE_DEADTIME_US) {
+                    mg_trace(TrEdge, 1, d, 0);
+                    continue; // re-trigger inside one mark
+                }
+                g_last_lead = now;
+                g_edge_pending = IrBitUp;
+                if(width) *width = d;
+                if(d >= MG_EDGE_BIT1_DARK_MAX_US) mg_trace(TrEdge, 2, d, 0);
+                if(d > MG_RX_DARK_MAX_US) return IrNone;
+                if(d < MG_EDGE_BIT0_DARK_MAX_US) return IrBit0Down;
+                if(d < MG_EDGE_BIT1_DARK_MAX_US) return IrBit1Down;
+                if(d < MG_EDGE_HELLO_DARK_MAX_US) return IrHelloDown;
                 return IrBeginDown;
-            } else {
-                // Light just ended: d was the MARK duration.
-                if(d < MG_RX_MARK_MIN_US || d > MG_RX_MARK_MAX_US) return IrNone;
-                if(d < MG_RX_LONG_MARK_US) return IrBitUp;
-                return IrLongUp;
             }
+            // Pulse end: carries no information here.
         }
         if((gbc_ir_time_us() - start) >= wait_us) return IrNone;
     }
@@ -288,14 +310,17 @@ static MgResult mg_receive_hello(uint32_t window_us, bool masked) {
         uint32_t el = gbc_ir_time_us() - start;
         if(el >= window_us) break;
         MgIr v = mg_read_ir(window_us - el, &w1);
-        if(v == IrLongUp || v == IrBitUp) {
+        if(v == IrBitUp) {
             // gap + m2 always masked (short, ~1 ms); nest-safe inside `masked`.
             gbc_ir_lock();
             MgIr g = mg_read_ir(MG_RX_ELEMENT_US, &wg);
-            MgIr m2 = (g == IrHelloDown) ? mg_read_ir(MG_RX_ELEMENT_US, &w2) : IrNone;
+            // The hello gap (731 us) and the cart's preamble gap (931 us)
+            // are close; accept either here.
+            bool gap_ok = (g == IrHelloDown) || (g == IrBeginDown);
+            MgIr m2 = gap_ok ? mg_read_ir(MG_RX_ELEMENT_US, &w2) : IrNone;
             gbc_ir_unlock();
-            if(g != IrHelloDown) continue;
-            if(m2 != IrLongUp && m2 != IrBitUp) continue;
+            if(!gap_ok) continue;
+            if(m2 != IrBitUp) continue;
             mg_trace(TrRxHelloOk, 0, w1, wg);
             mg_trace(TrPulse, 0, w2, 0);
             r = MgOk;
@@ -308,7 +333,9 @@ static MgResult mg_receive_hello(uint32_t window_us, bool masked) {
 }
 
 // Port of receive_msg(): returns byte count, or -1 on error.
-// End of message = a LONG mark (the postamble), exactly like the reference.
+// The reference ended a message on the LONG postamble mark; we cannot see
+// mark lengths, so a message ends when a pulse is followed by a non-bit
+// period, or by nothing within MG_EDGE_END_WAIT_US.
 static int mg_receive_msg(uint8_t* buf, int bufsize) {
     mg_trace(TrMsgRx, (uint8_t)bufsize, 0, 0);
     uint32_t w;
@@ -331,36 +358,41 @@ static int mg_receive_msg(uint8_t* buf, int bufsize) {
         }
         v = mg_read_ir(MG_RX_WINDOW_US - el, &w);
         if(v == IrNone || v == IrHelloDown || v == IrBeginDown) continue;
-        if(v == IrLongUp || v == IrBitUp) break; // the preamble mark
+        if(v == IrBitUp) break; // the preamble mark
         mg_trace(TrTimeout, TW_SCAN_MID, v, w);
         goto out;
     }
 
-    // The preamble space (610-725 us: HelloDown or BeginDown both accepted).
+    // The preamble period (cart: 931 us; HelloDown or BeginDown accepted).
     v = mg_read_ir(MG_RX_ELEMENT_US, &w);
     if(v != IrBeginDown && v != IrHelloDown) {
+        // The TFBS4711 has been seen to drop the postamble pulse of an EMPTY
+        // message, so the next edge is the following message's preamble
+        // (~1.5 ms on). An empty message carries nothing, and the block
+        // checksum still validates it, so accept that.
+        if(bufsize == 0 && v == IrNone && w > MG_RX_DARK_MAX_US) {
+            mg_trace(TrSyncOk, 1, 0, w);
+            ret = 0;
+            goto out;
+        }
         mg_trace(TrTimeout, TW_PREAMBLE, v, w);
         goto out;
     }
     mg_trace(TrSyncOk, 0, 0, w);
 
-    // Bits, MSB first; a LONG mark ends the message.
+    // Bits, MSB first; a pulse followed by a non-bit period ends the message.
     {
         int bit = 7;
         int byte = 0;
         for(int i = 0; i < bufsize; i++) buf[i] = 0;
         for(;;) {
             v = mg_read_ir(MG_RX_ELEMENT_US, &w);
-            if(v == IrLongUp) break; // postamble mark: end of message
             if(v != IrBitUp) {
                 mg_trace(TrTimeout, TW_BITMARK, byte, v);
                 goto out;
             }
-            v = mg_read_ir(MG_RX_ELEMENT_US, &w);
-            if(v != IrBit0Down && v != IrBit1Down) {
-                mg_trace(TrTimeout, TW_BITDARK, byte, v);
-                goto out;
-            }
+            v = mg_read_ir(MG_EDGE_END_WAIT_US, &w);
+            if(v != IrBit0Down && v != IrBit1Down) break; // that pulse was the postamble
             if(byte >= bufsize) {
                 mg_trace(TrTimeout, TW_OVERFLOW, byte, 0);
                 goto out;
@@ -577,7 +609,12 @@ static MgResult mg_recv_one_payload(
     return MgOk;
 }
 
-static MgResult mg_sender_one_pass(const MgProtocol* p, const uint8_t* payload, uint8_t len) {
+static MgResult mg_sender_one_pass(
+    const MgProtocol* p,
+    const uint8_t* payload,
+    uint8_t len,
+    uint8_t* capture,
+    uint8_t* capture_len) {
     uint8_t partner[MG_MAX_MSG];
     uint8_t partner_len = 0;
     uint8_t region = p->region_code; // fallback if capture fails
@@ -585,6 +622,11 @@ static MgResult mg_sender_one_pass(const MgProtocol* p, const uint8_t* payload, 
     MG_TRY(mg_send_one_payload(p, payload, len, &region));
     MG_TRY(mg_begin_receiving(p));
     MG_TRY(mg_recv_one_payload(p, partner, sizeof(partner), &partner_len, region));
+    if(capture && capture_len) {
+        uint8_t n = partner_len < MG_CAPTURE_CAP ? partner_len : MG_CAPTURE_CAP;
+        memcpy(capture, partner, n);
+        *capture_len = n;
+    }
     // The hello + empty-block tail closes every pass ("finish" in reference).
     mg_trace(TrStep, ST_TAIL, 0, 0);
     MG_TRY(mg_begin_sending(p));
@@ -625,7 +667,7 @@ MgResult mg_sender_send_gift(
 
     mg_logf(p, "pass 1 (%u B)", len1);
     mg_trace(TrStep, ST_PASS1, len1, 0);
-    MG_TRY(mg_sender_one_pass(p, payload1, len1));
+    MG_TRY(mg_sender_one_pass(p, payload1, len1, p->partner1, p->partner1_len));
 
     if(len2 > 0) {
         // Reference: 2 ms + the hello's own 3 ms lead = 5 ms between passes.
@@ -633,7 +675,7 @@ MgResult mg_sender_send_gift(
         mg_logf(p, "pass 2 (%u B)", len2);
         mg_trace(TrStep, ST_PASS2, len2, 0);
         MG_TRY(mg_begin_sending_ex(p, 1));
-        MG_TRY(mg_sender_one_pass(p, payload2, len2));
+        MG_TRY(mg_sender_one_pass(p, payload2, len2, p->partner2, p->partner2_len));
     }
 
     mg_logf(p, "done: OK");

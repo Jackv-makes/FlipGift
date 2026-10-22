@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Nicolas Aubry
+// Copyright (C) 2026 Nicolas Aubry (original timings)
+// Copyright (C) 2026 @Jackv_makes (TFBS4711 receiver thresholds)
 
 /**
  * mg_timing.h - Timing and protocol constants for the Gen II Mystery Gift IR protocol.
@@ -28,23 +29,28 @@
 #define MG_BIT0_SPACE_US 120
 #define MG_BIT1_SPACE_US 299
 
-// ---- RX classifier: a faithful port of the reference read_ir() -----------
-// Every edge yields ONE classified period. Dark periods (us):
-//   <40 or >1400 -> junk; <170 -> bit 0; <420 -> bit 1; <680 -> hello gap
-//   (the GBC preamble space, 610-640 measured, also lands here); else preamble.
-// Mark periods: <40 or >320 -> junk; < LONG_MARK -> data-bit mark; else a
-// hello/preamble/POSTAMBLE mark (message end is detected by seeing one).
-// The reference put the long-mark boundary at 160 because its receiver
-// stretches pulses; ours measures true widths (bits 55-60, postamble 119-125,
-// hello 148-155 -- from the on-hardware trace), so the boundary sits at 90.
-#define MG_RX_DARK_MIN_US 40
-#define MG_RX_BIT0_DARK_MAX_US 170
-#define MG_RX_BIT1_DARK_MAX_US 420
-#define MG_RX_HELLO_DARK_MAX_US 680
-#define MG_RX_DARK_MAX_US 1400
-#define MG_RX_MARK_MIN_US 40
-#define MG_RX_LONG_MARK_US 90
-#define MG_RX_MARK_MAX_US 320
+// ---- RX classifier: periods between TFBS4711 leading-edge pulses ---------
+// The transceiver emits one ~2 us pulse per rising light edge, so a period
+// is the cart's mark plus its following space. Measured against a US Gold
+// cart: bit 0 ~175, bit 1 ~355, hello 731, postamble->next 731-771,
+// preamble 931. Thresholds sit between those.
+#define MG_EDGE_BIT0_DARK_MAX_US 265
+#define MG_EDGE_BIT1_DARK_MAX_US 520
+#define MG_EDGE_HELLO_DARK_MAX_US 830
+#define MG_RX_DARK_MAX_US 1400 // longer = junk (idle, our own TX tail)
+// A second leading edge sooner than this after the last one is the receiver
+// re-triggering inside one cart mark (seen: 97 us), not a new pulse. The
+// shortest real period is a bit 0 at ~172 us.
+#define MG_EDGE_DEADTIME_US 120
+// After a pulse, how long to wait for the next one before calling the
+// message finished. A data bit's next edge comes within ~366 us; the next
+// message's preamble pulse comes ~731 us after a postamble and MUST be
+// caught inside this (IRQ-masked) wait: on return the OS catches up on
+// ~0.7 ms of deferred interrupts and a 2 us pulse arriving then is lost
+// (seen with 700 us). Waiting the full 5 ms element timeout instead broke
+// the pass-2 handshake: the cart listens for our next hello for only
+// 7.8 ms after it ACKs the tail block.
+#define MG_EDGE_END_WAIT_US 1000
 // Reference wait budgets: 50 ms to find a hello/message, 5 ms per element.
 #define MG_RX_WINDOW_US 50000
 #define MG_RX_ELEMENT_US 5000

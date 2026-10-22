@@ -22,6 +22,79 @@ const char* mg_item_name(uint8_t index) {
     return (index < MG_ITEM_COUNT) ? mg_item_names[index] : "?";
 }
 
+// Names mirror MysteryGiftDecos (data/decorations/mystery_gift_decos.asm).
+static const char* const mg_deco_names[MG_DECO_COUNT] = {
+    "Jigglypuff Doll", "Poliwag Doll",  "Diglett Doll",   "Staryu Doll",     "Magikarp Doll",
+    "Oddish Doll",     "Gengar Doll",   "Shellder Doll",  "Grimer Doll",     "Voltorb Doll",
+    "Clefairy Poster", "Jigglyp.Poster", "SNES",          "Weedle Doll",     "Geodude Doll",
+    "Machop Doll",     "Magna Plant",   "Tropic Plant",   "Famicom",         "N64",
+    "Bulbasaur Doll",  "Squirtle Doll", "Pink Bed",       "Polkadot Bed",    "Red Carpet",
+    "Blue Carpet",     "Yellow Carpet", "Green Carpet",   "Jumbo Plant",     "Virtual Boy",
+    "Big Onix Doll",   "Pikachu Poster", "Big Lapras Doll", "Surf Pika Doll", "Pikachu Bed",
+    "Unown Doll",      "Tentacool Doll",
+};
+
+const char* mg_deco_name(uint8_t index) {
+    return (index < MG_DECO_COUNT) ? mg_deco_names[index] : "?";
+}
+
+char mg_gen2_to_ascii(uint8_t code) {
+    if(code >= 0x80 && code <= 0x99) return (char)('A' + (code - 0x80));
+    if(code >= 0xA0 && code <= 0xB9) return (char)('a' + (code - 0xA0));
+    if(code >= 0xF6) return (char)('0' + (code - 0xF6)); // 0xF6..0xFF
+    switch(code) {
+    case 0x7F: return ' ';
+    case 0xE7: return '!';
+    case 0xE6: return '?';
+    case 0xE3: return '-';
+    case 0xE8: return '.';
+    case 0x9A: return '(';
+    case 0x9B: return ')';
+    case 0x9C: return ':';
+    case 0x9D: return ';';
+    case 0x9E: return '[';
+    case 0x9F: return ']';
+    default: return '?';
+    }
+}
+
+bool mg_gift_parse_payload1(const uint8_t* buf, uint8_t len, MgPartnerInfo* out) {
+    if(!buf || !out || len < MG_PAYLOAD1_LEN) return false;
+    memset(out, 0, sizeof(*out));
+    out->version = buf[P1_OFF_VERSION];
+    out->trainer_id = ((uint16_t)buf[P1_OFF_TID_HI] << 8) | buf[P1_OFF_TID_LO];
+    uint8_t n = 0;
+    for(uint8_t i = 0; i < P1_NAME_LEN; i++) {
+        uint8_t c = buf[P1_OFF_NAME + i];
+        if(c == 0x50 || c == 0x00) break;
+        out->trainer_name[n++] = mg_gen2_to_ascii(c);
+    }
+    out->trainer_name[n] = '\0';
+    out->pokedex_count = buf[P1_OFF_DEX_COUNT];
+    out->sent_deco = buf[P1_OFF_SENT_DECO];
+    out->which_item = buf[P1_OFF_WHICH_ITEM];
+    out->which_deco = buf[P1_OFF_WHICH_DECO];
+    out->backup_item = buf[P1_OFF_BACKUP_ITEM];
+    out->counter = buf[P1_OFF_COUNTER];
+    return true;
+}
+
+uint8_t mg_gift_parse_payload2(const uint8_t* buf, uint8_t len, MgPartyMon* out) {
+    if(!buf || !out) return 0;
+    uint8_t count = 0;
+    for(uint8_t off = 0; count < MG_PARTY_MAX && off + MG_PARTY_MON_SIZE <= len; off += MG_PARTY_MON_SIZE) {
+        if(buf[off] == 0xFF || buf[off] == 0x00) break; // terminator / padding
+        out[count].level = buf[off];
+        out[count].species = buf[off + 1];
+        out[count].move1 = buf[off + 2];
+        out[count].move2 = buf[off + 3];
+        out[count].move3 = buf[off + 4];
+        out[count].move4 = buf[off + 5];
+        count++;
+    }
+    return count;
+}
+
 // Gen II text encoding (subset). Terminator 0x50, space 0x7F.
 uint8_t mg_gen2_char(char c) {
     if(c >= 'A' && c <= 'Z') return 0x80 + (c - 'A');

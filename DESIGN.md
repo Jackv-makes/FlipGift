@@ -1,290 +1,157 @@
-# Flipper Zero → Pokémon Crystal Mystery Gift over IR — Design Document
+# Flipgift design notes
 
-Status: **DRAFT for review** (no code written yet — pending sign-off)
-Decisions locked: firmware = **Momentum**; transmit = **external IR LED** (not onboard); receive = **external photodiode + TIA front end**.
-Target game: Pokémon Gold / Silver / **Crystal** (Gen II) on Game Boy Color
-Source of truth: [pokecrystal disassembly `engine/link/mystery_gift.asm`](https://github.com/pret/pokecrystal/blob/master/engine/link/mystery_gift.asm) + [projectpokemon IR RE thread](https://projectpokemon.org/home/forums/topic/43930-mystery-gift-reverse-engineering-of-ir-protocol/)
+How a Gen II Mystery Gift gets from a Flipper Zero to a Game Boy Color through
+a part that was never meant to carry it. The original analog-front-end design
+this grew out of is in [docs/upstream-DESIGN.md](docs/upstream-DESIGN.md); the
+protocol section there is still the reference for message framing, checksums
+and the two-pass exchange, and is not repeated here.
 
----
+## 1. The link in one paragraph
 
-## 0. TL;DR of the hard part
+The Game Boy's IR port is baseband on/off light. A message is a long preamble
+mark, a long space, then one mark per bit whose following space is short for a
+0 and long for a 1, then a long postamble mark and space. A hello is two long
+marks with a gap. Both sides take turns as master, each block of three messages
+is answered with a one-byte ACK, and the cart gives up on any wait after a
+timer-based window. Everything below is about getting those marks and spaces
+through a TFBS4711.
 
-There are **two independent problems**, and they get conflated in issue #29 ("generic 38 kHz IR"):
+## 2. What the TFBS4711 does to the signal
 
-| Problem | Layer | Can firmware fix it? |
+From the Vishay datasheet (82633, rev 3.9), confirmed on the bench:
+
+| Direction | Behaviour | Consequence |
 |---|---|---|
-| **A. Physical RX** — the GBC emits *un-modulated* light (no carrier). The Flipper's onboard IR receiver is a **TSOP demodulator** that only responds to a ~38 kHz carrier, so it is physically blind to the GBC. | Hardware | **No.** No firmware/PR can make a demodulating sensor see un-modulated light. Needs an **external photodiode/phototransistor** on a GPIO. |
-| **B. Bidirectional API** — `furi_hal_infrared` is TX-*xor*-RX and carrier-oriented; the protocol needs µs-precise half-duplex turnarounds. | Software | **Yes**, but not by patching `furi_hal_infrared`. Bypass it with our own bit-bang HAL (GPIO + TIM + EXTI). This is the "C lib." |
+| TX | A TXD pulse under 23 µs is reproduced within ±0.15 µs. | Short pulses are exact. |
+| TX | A TXD pulse of 23 µs or more produces 23 to 100 µs of light, typically 50. | A 52 µs bit mark or 126 µs hello mark driven directly comes out at an unknown length. |
+| TX | TXD held past 100 µs disables the LED driver until it is released. | A 126 µs mark driven directly is cut off. |
+| RX | RXD emits one low pulse of 1.7 to 3 µs on each rising light edge, independent of the light's duration. | Mark lengths are invisible. Only the timing between pulses survives. |
+| RX | RXD mirrors TXD while transmitting. | Our own pulses appear on RXD; harmless because the link is half duplex. |
+| RX | The receiver occasionally re-triggers inside one of the cart's long marks (seen 97 µs after the leading edge) and occasionally drops the postamble pulse of an empty message. | Needs a dead time and a tolerance, below. |
 
-**The GBC IR signal is NOT 38 kHz modulated.** Confirmed from the disassembly: `SendInfraredLEDOn` sets `RP_LED_ON` steady for the whole mark — there is no software carrier toggling. The maintainer's "38 kHz" note is loose shorthand for "generic on/off IR."
+## 3. Transmit: chained pulses
 
-**Conclusion:** You need external RX hardware **regardless** of the firmware-vs-app decision. Given that, the cleanest software path is an **app-level bit-bang C module**, not a Momentum firmware PR (details in §5).
+Every mark, whatever its length, is sent as a chain of 20 µs pulses separated by
+2 µs gaps, in `gbc_ir_tx_mark()`. The chain is timed as a whole so the mark
+still spans its nominal length including the gaps. The cart's receiver is a
+phototransistor into a common-base amplifier with an AC-coupled comparator;
+its response is far slower than 2 µs, so the gaps never reach the comparator.
+Verified by the cart ACKing every block of a complete exchange.
 
----
+The cart decodes bits by the interval between consecutive mark *ends*
+(`ReceiveIRDataMessage` samples TIMA after each light-to-dark transition, with
+$12 timer ticks of 15.26 µs, about 275 µs, as the 0/1 threshold). A chained
+mark ends at the end of its last pulse, exactly where a solid mark would, so
+the bit timing the cart sees is unchanged. Driving the mark as one long TXD
+pulse and letting the transceiver clamp it would have put up to 77 µs of
+jitter on that end, against margins of about 100 µs, which is why chaining is
+used for bit marks too and not only for the long ones.
 
-## 1. Goal & scope
+## 4. Receive: leading-edge periods
 
-Build a Flipper Zero `.fap` that impersonates a Gen II Pokémon game and pushes a **Mystery Gift** (an item or a decoration, optionally a party-data pass) to a real Crystal cartridge sitting on its Mystery Gift screen.
+`mg_read_ir()` in `mg_protocol.c` reports two events per pulse. At each
+accepted leading edge it returns the *period* since the previous leading edge,
+classified as a bit 0, a bit 1, a hello gap or a preamble; on the following
+call it returns an instant mark event for the pulse itself. The protocol code
+above it, which was written for a mark/dark rhythm, is unchanged.
 
-In scope:
-- Flipper acts as the **SENDER** (the game stays the receiver — user does **not** press A on the GBC).
-- One gift: configurable item/decoration ID + trainer name + trainer ID.
-- Full handshake, checksum, ACK, and role-reversal handling required to satisfy the game.
+The period is the cart's mark plus its following space. Measured from a US
+Gold cart, which runs its IR timer at 65 536 Hz with a 2-tick reload (30.5 µs
+per interrupt) for framing and a 12-tick reload (183 µs) for bits:
 
-Out of scope (v1):
-- Receiving a gift *from* the game (we still must handle the reverse-role sub-exchanges the protocol forces on us, but we won't surface received gifts to the user).
-- Name Card exchange (separate `NAME_CARD_PREFIX = 0x3c` flow — noted but not built).
-- Pokémon Pikachu 2 device emulation.
-
----
-
-## 2. Protocol specification (extracted from the disassembly + forum)
-
-### 2.1 Line coding — what a "mark" and "space" are
-- **Mark (HIGH)** = IR LED ON (light present).
-- **Space (LOW)** = IR LED OFF.
-- Bit order within a byte: **MSB first**.
-- Multi-byte fields (checksum): **little-endian** (low byte first).
-
-### 2.2 Timing (send targets — forum-measured, the values the game's receiver decodes)
-| Element | Mark | Space |
+| Period | Measured | Threshold used |
 |---|---|---|
-| **Hello** | 126 µs | 537 µs | (then 126 µs mark) |
-| **Data-message preamble** | 126 µs | 725 µs |
-| **Bit = 0** | 52 µs | 120 µs |
-| **Bit = 1** | 52 µs | 299 µs |
-| **Data-message postamble** | 109 µs | 620 µs |
-| Between messages (same block) | — | ~1–2 ms space |
-| Between passes / role swaps | — | ≥ 5 ms space |
+| Bit 0 (61 µs mark + one 183 µs interrupt) | ~175 µs | < 265 |
+| Bit 1 (two interrupts) | ~355 µs | < 520 |
+| Hello gap, postamble to next preamble | 731 to 771 µs | < 830 |
+| Preamble (150 µs mark + 20 interrupts + one bit interrupt) | 931 µs | ≤ 1400 |
 
-Cross-check against the disassembly's fast IR timer: `TMA=-2` @ 65 536 Hz ⇒ ~30.5 µs/interrupt, and the LED helpers hold for `d-1` interrupts (`ld d,5` ⇒ 4 × 30.5 ≈ 122 µs ≈ the 126 µs hello mark). The two sources agree to within measurement tolerance. **We calibrate final numbers on-device** (the game's receiver thresholds bits by *space* length, so there is slack).
+Three rules make this robust:
 
-### 2.3 RX decode (what the game's SENDER emits, Flipper measures)
-Same waveform shape. Decode rule: after each ~52 µs mark, measure the following space — **space < ~210 µs ⇒ bit 0, else ⇒ bit 1** (midpoint of 120 and 299). Message framing is found via the long preamble space (~725 µs) and the postamble.
+- **Dead time, 120 µs.** A second leading edge sooner than this is the receiver
+  re-triggering inside one of the cart's long marks and is ignored. The
+  shortest real period is a bit 0 at about 172 µs.
+- **Instant mark events.** The pulse is only 2 µs long. If the code had to
+  observe the pulse's end, any step that arrives late, such as the ACK read
+  returning just as the cart's next hello begins, would miss it. Queueing the
+  mark at the leading edge removes that dependency entirely; this fixed the
+  role-swap failure seen during bring-up.
+- **End of message after 1 ms of silence.** A message ends when a pulse is
+  followed by a non-bit period, or by nothing for `MG_EDGE_END_WAIT_US`
+  (1000 µs). The value is boxed in from both sides. Below about 750 µs the next
+  message's preamble pulse, 731 µs after the postamble, arrives after the wait
+  has returned and interrupts have been unmasked, and the Flipper's OS then
+  catches up on roughly 0.7 ms of deferred interrupt work, during which a 2 µs
+  pulse is lost (seen with 700 µs). At the reference's 5 ms element timeout the
+  wait after the cart's final ACK pushed our pass-2 hello to about 10 ms after
+  the ACK, outside the 7.8 ms the cart listens for it (section 5).
 
-### 2.4 Message & block structure
-A **data block** = **3 messages**, followed by a **1-byte ACK message** from the partner:
+One tolerance: the receiver sometimes drops the postamble pulse of a
+zero-length message, so the next pulse seen after its preamble is the following
+message's preamble about 1.5 ms later. An empty message carries no data and the
+block checksum still covers it, so that pattern is accepted as a complete empty
+message.
 
-```
-Message 1:  [0x5A]  [len]                 ; MESSAGE_PREFIX + payload length
-Message 2:  [b0 b1 ... b(len-1)]          ; the payload (may be empty, len=0)
-Message 3:  [cksum_lo] [cksum_hi]         ; 16-bit sum, little-endian
---- partner replies ---
-ACK:        [status]                      ; 0x6C = MG_OKAY on success
-```
+## 5. The cart's timing windows
 
-- `MESSAGE_PREFIX = 0x5A`
-- **Checksum** = 16-bit sum of **every byte in messages 1 and 2** (i.e. `0x5A + len + Σ payload bytes`), transmitted low byte then high byte.
-- **ACK / status byte**: `MG_OKAY = 0x6C`. Derivation: `MG_NOT_OKAY = WRONG_CHECKSUM(0x01) | TIMED_OUT(0x02) | CANCELED(0x10) | WRONG_PREFIX(0x80) = 0x93`; `MG_OKAY = ~0x93 = 0x6C`. Matches the forum's "acknowledgement 0x6C."
+From `engine/link/mystery_gift.asm` in pokegold and pokecrystal, which are
+identical for this purpose:
 
-### 2.5 Hello / role negotiation
-- Game boots into **receiver** mode on the Mystery Gift screen, polling the IR-in bit. If it sees incoming IR before the player presses A, it drops into `ReceiveIRHelloMessage` and becomes the **receiver**. So: **the user leaves the GBC on the screen and does NOT press A; the Flipper sends the first hello and becomes SENDER.**
-- Hello waveform (from `SendIRHelloMessage`): leading space (~1.8 ms), mark, space, mark, trailing space — i.e. two short marks separated by a ~600 µs space (the "126/537/126" of §2.2).
-- After the sender's hello, the **receiver echoes an identical hello back**; the sender must RX that echo to proceed. (This is the first place we *must* receive.)
+- The timer runs at 65 536 Hz. Framing uses a 2-tick reload, 30.5 µs per
+  interrupt; bits use a 12-tick reload, 183 µs; bit decoding on receive uses a
+  256-tick reload for the TIMA measurement.
+- A hello is LED off for 60 interrupts (1.83 ms), on for 4 (122 µs plus the
+  partial first interval, 148 to 155 µs measured), off for 20 (610 µs), on for
+  4, off for 4. The sender then waits for the partner's reply with 256-interrupt
+  (7.8 ms) windows on each edge.
+- `ReceiveIRHelloMessage` waits up to 7.8 ms for the first mark. This is the
+  window our hello has to land in whenever the cart swaps to listening: after
+  each of its ACKs mid-exchange, and after it ACKs the tail block between pass
+  1 and pass 2. Our hello carries a 3 ms lead of darkness, and the inter-pass
+  gap is 2 ms, so the ACK read must return within about 2 ms of the ACK's last
+  pulse for the hello to make the window.
+- Between passes the cart copies the received trainer record, stages its party
+  data, and goes straight to `ReceiveIRHelloMessage`. There is no restart loop
+  there: one missed hello is a communication error.
+- After a communication error the game prints the message and jumps back to
+  `DoMysteryGift`, where `InitializeIRCommunicationRoles` polls both the
+  joypad and the IR line. It falls into hello reception as soon as it sees
+  light, so a retry from the Flipper works without A being pressed again.
 
-### 2.6 Full SENDER state machine (Flipper = sender, from `SenderExchangeMysteryGiftDataPayloads` + `SendMysteryGiftDataPayload`)
+## 6. Interrupt masking on the Flipper
 
-For **each** of the two payloads (message-count starts at 2; decrements each pass):
+Each transmitted message and each received message runs with interrupts
+masked, as in the upstream design, so a context switch can't stretch a 20 µs
+pulse or hide a 2 µs one. The cost is that unmasking after a 10 to 40 ms
+message releases a burst of deferred interrupt work. Section 4's end-of-message
+wait exists so that nothing time-critical happens during that burst. The
+multi-second trigger listen at the start stays unmasked; a missed hello there
+only costs a retry.
 
-```
-SendMysteryGiftDataPayload:
-  TX hello                                  ; become sender
-  TX block [0x96]            → RX ack        ; REGION_PREFIX
-  TX block []  (empty)       → RX ack
-  RX hello                                  ; SWITCH: become receiver
-  RX block  (1 byte)         → TX ack        ; partner's REGION_CODE (verify)
-  RX block []  (empty)       → TX ack
-  TX hello                                  ; SWITCH: become sender
-  TX block [payload bytes]   → RX ack        ; the actual gift data
-  TX block []  (empty)       → RX ack
-```
+## 7. The flight recorder
 
-Then the sender switches to receiving the game's own payload (`BeginReceivingIRCommunication` → `ReceiveMysteryGiftDataPayload`), which mirrors the above. After both passes, an empty block is exchanged and the session ends with `MG_OKAY`.
+`mg_trace()` records up to 1024 events per attempt with a microsecond
+timestamp. `worker_dump_trace()` writes them to `apps_data/flipgift/last_trace.txt`
+after every attempt, appending within one send and starting a new file for the
+next. Lines worth knowing:
 
-- `REGION_PREFIX = 0x96` (constant, region-independent).
-- `REGION_CODE` = the game's region: **USA `0x90`**, France `0x9A`, Germany `0x9F`, Italy `0x99`, Spain `0x96`. → **make this a setting**; default to the user's cart (FR `0x9A` if targeting a French Crystal).
-- Wrong prefix ⇒ `MG_WRONG_PREFIX`; wrong checksum ⇒ `MG_WRONG_CHECKSUM`; no edges within 256 timer ticks ⇒ `MG_TIMED_OUT`. On any non-OK, the game restarts the hello loop (4-second retry window: `ld b, 60*4`).
+| Line | Meaning |
+|---|---|
+| `edge period N` | A leading edge whose period was longer than a bit; the normal values are 731/771 (postamble to next), 931 (preamble), and large numbers after our own transmissions. |
+| `edge dead N` | A re-trigger rejected by the dead time. |
+| `rx-hello m1=2 gap=731` | The cart's hello, both pulses seen. |
+| `sync s=931` | A message's preamble period. `sync s=1525` is an empty message whose postamble was dropped. |
+| `byte[i]=0x..` | A decoded byte. |
+| `ack-rx=0x6C` / `ack-tx=0x6C` | The cart's ACK of our block / ours of theirs. |
+| `TMO where a b` | Where a receive gave up and the class and width it saw. |
+| `done r=0` | Success. |
 
-### 2.7 Payload byte layout (CONFIRMED against pokecrystal)
-Verified against `ram/wram.asm` (`wMysteryGiftPartnerData`), `engine/link/mystery_gift_2.asm`
-(`StageDataForMysteryGift`), and `engine/link/mystery_gift.asm` (`StagePartyDataForMysteryGift`).
-`NAME_LENGTH = 11`, `PARTY_LENGTH = 6`, `NUM_MOVES = 4`.
+A complete successful exchange is about 520 events.
 
-**Payload 1 — `wMysteryGiftPartnerData`, exactly 20 bytes:**
-```
-[0]      version        (GS_VERSION+1 == 0x01 for Gold/Crystal)
-[1]      trainer ID hi  (BIG-endian: high byte first -- matches forum "high, low")
-[2]      trainer ID lo
-[3..13]  trainer name   (11 bytes, Gen II charset, 0x50-terminated + padded)
-[14]     pokédex caught count
-[15]     sent_deco      (0 => gift is an ITEM, 1 => a DECORATION)
-[16]     which_item     (INDEX into MysteryGiftItems, NOT a raw item id)
-[17]     which_deco     (INDEX into MysteryGiftDecos)
-[18]     backup_item    (MUST be 0, else the cart shows "friend not ready")
-[19]     counter        (daily-partner counter; 0 is fine)
-```
-`which_item` maps through the game's 37-entry table (0=Berry … 34=Rare Candy …
-36=Mirage Mail); out-of-range falls back to Great Ball in-game. Full table is
-baked into `mg_gift.h` as `MG_ITEM_*`.
+## 8. What was tried and dropped
 
-**Payload 2 — party data, exactly 38 bytes** (`StagePartyDataForMysteryGift`):
-up to 6 × `[level][species][move1..4]`, then a `0xFF` terminator, remainder is
-leftover staging bytes (we pad with 0). No leading byte. The **length must be
-38**; content is not validated for an item gift (after pass 2 the cart quits
-before copying the party buffer into partner data).
-
----
-
-## 3. Hardware design
-
-### 3.1 Bill of materials (confirmed)
-**Emitter:** TSAL6200 (or SFH 4544) ~940 nm IR LED ×1 · 100 Ω LED resistor ×1 · BC337 NPN (2N3904/BC547 sub) ×1 · 1 kΩ base resistor ×1.
-**Receiver:** BPW34 (or SFH 205 F) photodiode ×1 · MCP6002 dual rail-to-rail op-amp (DIP-8) ×1 · 50 kΩ feedback (47 kΩ OK) ×1 · 120 pF feedback cap ×1 · 47 nF cap (473) ×1 · 20 kΩ · 2 kΩ · 100 Ω · 1N4148 signal diode ×1 · BC337 output buffer ×1.
-
-### 3.2 Flipper GPIO pin map (Momentum / standard Flipper header)
-| Signal | Header pin | Symbol in firmware | Notes |
-|---|---|---|---|
-| **IR TX** (to LED driver) | 2 | `gpio_ext_pa7` | plain push-pull output; software-timed marks/spaces. PA7 also carries TIM1.1N / TIM17.1 / TIM16.1, so hardware-PWM pulse generation stays available as a future upgrade. Not shared with any button. |
-| **IR RX** (from receiver) | 16 | `gpio_ext_pc0` | plain digital input, **polled** (we never use EXTI, so the RX line needs no interrupt). PC0 is a clean dedicated pin — not shared with any key or subsystem. |
-| **Board Vcc** (op-amp Vdd + LED anode) | **9 (3V3)** to start, **1 (+5 V)** later | — | see power note below |
-| **GND** | 8 / 11 / 18 | — | common ground for Flipper + receiver + emitter |
-
-**Power — start at 3.3 V, escalate only if needed.** Wire the whole board's Vcc
-to **pin 9 (3V3)** and leave OTG **off** (`enable_otg_5v = false`, the default).
-The MCP6002 is rated 1.8–6 V and the LED still gets ~17 mA through 100 Ω, so this
-works at close range with no OTG. The reference schematic is a **5 V** design
-(its comparator thresholds were sized for 5 V and the LED gets ~34 mA there), so
-if RX sensitivity or TX range disappoints: move Vcc to **pin 1 (+5 V)** and set
-`enable_otg_5v = true`. Both stages share the one rail, so they move together.
-
-**Why PC0 and not PC3/PA6?** We poll the RX pin (see §4), so the classic reason to
-pick a pin — EXTI/timer capability — doesn't apply. That frees us to choose the
-pin with the fewest conflicts: **PC3 (pin 7) is shared with the OK key** (EXTI3),
-so it's a poor RX choice; **PC0 (pin 16)** is marked used by no key or subsystem,
-making it the cleanest dedicated input. (TX and RX are no longer adjacent, but a
-short jumper on the "GBC-IR hat" is trivial.)
-
-**No 3V3 rail is needed.** The receiver's open-collector output is pulled to 3.3 V
-by the STM32's **internal pull-up** on PC0, which also keeps the pin GPIO-safe even
-though the op-amp runs at 5 V. Header pin 9 (3V3) is therefore unused; only wire it
-if you'd rather fit an external pull-up than enable the internal one.
-
-### 3.3 Emitter stage (confirmed schematic — low-side NPN switch)
-```
-   +Vcc (board rail: pin 9 = 3V3 to start, pin 1 = +5V later)
-     │
-   [TSAL6200]  (anode → cathode, pointing at GBC IR window)
-     │
-   [100 Ω]
-     │
-     ├──────── C
-              BC337 (NPN)
-  PA7 ─[1kΩ]─ B
-              E
-     │
-    GND (pin 8)
-```
-Logic: **PA7 HIGH ⇒ LED ON = mark; PA7 LOW ⇒ LED OFF = space** (non-inverting). LED current ≈ **17 mA** at 3.3 V, **34 mA** at 5 V (both well within TSAL6200's 100 mA rating) — the difference is TX range, which is why 3.3 V is the starting point and 5 V the range upgrade.
-
-### 3.4 Receiver stage — confirmed from the projectpokemon reference schematic
-Original circuit (by the RE thread author, drawn for a Raspberry Pi). Topology:
-```
- SFH 205 F ──▶ [MCP607-A: TIA, +in→GND, Rf=50k ∥ Cf=120pF]
-                        │ output
-                     [47nF] ── node ── [50k → GND]
-                        │
-              [MCP607-B: comparator, 20k/20k network;
-               100Ω + UF4004 + 2k branch sets threshold/clamp]
-                        │ output
-                     [20k] ──▶ base of BC337 (common-emitter)
-                        collector ──▶ GPIO  |  emitter ──▶ GND
-```
-- **Op-amps = MCP607** (single ×2) in the reference; your **MCP6002** (dual) is a drop-in equivalent — one package instead of two.
-- **Photodiode** SFH 205 F in the reference; your **BPW34** is equivalent. **UF4004** ultrafast diode in the reference; **1N4148** is a fine (better, for this signal-level role) substitute.
-- **TIA bandwidth** = 1/(2π·50k·120p) ≈ **26.5 kHz**. Shortest pulse we must resolve is the **52 µs mark** (~9.6 kHz fundamental) — passes with slightly rounded edges, acceptable since bits are decided by *space* width, not edge sharpness. If marks look mushy on a scope, drop C_f to ~68 pF (BW → ~47 kHz).
-
-### 3.5 Flipper-specific adaptations (this circuit was drawn for a Raspberry Pi)
-Three changes/confirmations vs the reference:
-
-1. **Supply — start at 3.3 V (pin 9, no OTG), 5 V (pin 1, OTG) as the fallback.** The reference is a 5 V design, but the MCP6002 runs fine at 3.3 V for close-range bring-up; escalate to 5 V only if range/sensitivity is poor. See §3.2's power note. This is a runtime one-liner (`enable_otg_5v`) plus moving the board's Vcc wire.
-2. **Output is inverting + open-collector → GPIO goes LOW when IR is present.** This never exposes PC0 to 5 V: the BC337 collector is pulled up to **3.3 V** by the STM32 **internal pull-up** on PC0 (do *not* pull it to 5 V). So `gbc_ir_hal` RX runs with `active_low = true`. The op-amp's 5 V rail only reaches the BC337 *base* through a 20 kΩ resistor (base clamped at ~0.7 V) — safe.
-3. **Emitter:** the reference direct-drives the LED from a GPIO through 200 Ω (≈9 mA). Your BOM's **BC337 + 100 Ω at 5 V (≈34 mA, §3.3)** is the better choice for range and keeps GPIO current low — use that. If you'd rather match the reference exactly during first bring-up, PA7 → 200 Ω → TSAL6200 → GND direct-drive (~9 mA) is within the Flipper's per-pin limit.
-
-**Common ground** between the Flipper header (pin 8/11/18) and the receiver board is mandatory.
-
-### 3.6 ⚠ Parts-quantity check against the schematic
-The schematic uses **more of some values than the original single-quantity BOM**. Recount before ordering:
-- **50 kΩ ×2** (TIA feedback *and* the post-47nF node to ground) — BOM had ×1.
-- **20 kΩ ×2** (comparator network) — BOM had ×1.
-- **100 Ω ×2 total** if you use the transistor emitter: one in the receiver (per schematic) **and** one for the LED driver (§3.3). BOM listed 100 Ω ×1.
-- 120 pF ×1, 47 nF ×1, 2 kΩ ×1, UF4004/1N4148 ×1 — quantities match.
-
----
-
-## 4. Software architecture
-
-```
-pokemon_mystery_gift.fap
-├── application.fam                 # ufbt manifest
-├── gbc_ir_hal.{c,h}                # THE C LIB: bit-bang half-duplex raw IR
-│     - gbc_ir_tx_mark(us)/space(us)      (GPIO or onboard LED)
-│     - gbc_ir_rx_wait_edge(timeout) -> width_us   (EXTI + TIM timestamps)
-│     - critical-section timing (disable IRQs during a message)
-├── mg_protocol.{c,h}               # message/block/checksum/ack, hello, state machine
-│     - mg_send_block(buf,len) / mg_recv_block(buf,&len)
-│     - mg_send_hello() / mg_recv_hello()
-│     - mg_sender_exchange()  <- drives §2.6
-├── mg_gift.{c,h}                   # build wMysteryGiftPartnerData + party payload
-│     - presets (item/decoration), trainer name/ID, region code
-├── scenes/  (GUI)                  # pick gift, set name/ID/region, "Send", status/log
-└── pokemon_mystery_gift.c          # app entry, view dispatcher, worker thread
-```
-
-Key implementation notes:
-- **Timing**: the message-level bit-bang must run with interrupts masked (`__disable_irq()` / `FURI_CRITICAL_ENTER`) for the duration of a single message (~a few ms) to hit µs tolerances; re-enable in the ≥1 ms inter-message gaps to service the OS. Use `DWT`/`furi_hal_cortex` cycle counter or a hardware timer for µs delays — **not** `furi_delay_us` in a tight loop if it's imprecise.
-- **RX capture**: prefer hardware **timer input-capture** on the RX pin over pure EXTI+polling for jitter resistance; EXTI is acceptable for a v1.
-- **No dependency on `furi_hal_infrared`** — we own the pins directly, sidestepping the TX-xor-RX limitation entirely.
-- Worker runs on its own thread; GUI thread stays responsive; a message log view helps debugging on-device.
-
----
-
-## 5. Firmware PR vs. application-level C lib — recommendation
-
-**Recommendation: build it as an application-level C module (`gbc_ir_hal`), not a Momentum firmware PR.** Reasons:
-
-1. **Physics doesn't care.** The RX limitation (§0-A) is a sensor problem; no firmware change removes the need for an external photodiode. So a PR wouldn't unlock onboard operation anyway.
-2. **`furi_hal_infrared` is the wrong abstraction.** It's built around carrier PWM + one-directional DMA capture. Our protocol is un-modulated, µs-precise, and half-duplex with fast turnarounds. Bit-banging raw GPIO is *simpler* than bending that API, and keeps all timing in one place we control.
-3. **Iteration speed.** An in-app module rebuilds/flashes in seconds with `ufbt`; a firmware change means building and flashing full Momentum and waiting on review.
-4. **Portability & upstreaming later.** If the module works, it's already structured as a clean HAL (`gbc_ir_*`) and can *then* be proposed upstream as `furi_hal_gbc_ir` / contributed to kbembedded's app or Momentum. Prove it in-app first.
-
-So: **the "new transmission C lib" you're picturing = `gbc_ir_hal.{c,h}` living inside the app.** A firmware PR is a possible *phase 2* once it's validated, not a prerequisite.
-
----
-
-## 6. Build, flash, test
-
-- Toolchain: [`ufbt`](https://github.com/flipperdevices/flipperzero-ufbt) (`pip install ufbt`; `ufbt` to fetch SDK). Target the firmware you run (Momentum SDK if on Momentum).
-- Build: `ufbt` → `ufbt launch` to flash+run over USB.
-- **Validation ladder** (each step de-risks the next):
-  1. **TX scope check**: capture the Flipper's IR output on a logic analyzer/scope; confirm hello + a data message match §2.2 timings.
-  2. **RX loopback**: point Flipper TX at its own external RX sensor; confirm it decodes its own bytes/checksum.
-  3. **Hello handshake with a real cart**: confirm the GBC echoes hello (game leaves the "Press A" screen).
-  4. **Single block + ACK**: confirm the game returns `0x6C`.
-  5. **Full gift**: item appears at the Goldenrod gift counter.
-
----
-
-## 7. Risks / open questions
-- **RX reliability** is the biggest risk (sensor choice, alignment, ambient IR). Mitigate with input-capture + generous thresholds + alignment guides.
-- ~~Exact payload offsets~~ — **DONE**, confirmed against pokecrystal (§2.7) and baked into `mg_gift.{c,h}`.
-- **Region gating** — does a French Crystal accept a gift stamped with a different region code? Make region a setting; test. (Prefix `0x96` is region-independent; the `REGION_CODE` byte is per-region.)
-- **Daily limits** — the game enforces "5 gifts/day" and "1/day per partner ID"; vary the trainer ID during testing.
-- **Timing under FreeRTOS** — masking IRQs for whole messages is required; verify audio/USB don't glitch the schedule.
-
----
-
-## 8. Proposed next steps (on approval)
-1. Lock down exact payload offsets from pokecrystal WRAM map.
-2. Decide pins + produce schematic/BOM for the external IR sensor (+ optional external TX LED).
-3. Scaffold the `ufbt` app with `gbc_ir_hal` stubs and the TX path first (validation steps 1–2 need no cart).
-4. Bring up the state machine against a real Crystal cart, calibrating timings.
+- A level-based receiver (the upstream classifier) with widened thresholds:
+  the 2 µs pulses were missed whenever the code arrived late to a pulse's end.
+- End-of-message wait of 700 µs: too short by 31 µs, see section 4.
+- A level-based classifier path kept behind a Board setting for an analog
+  front end: removed when the app was pinned to the FlippIR board.

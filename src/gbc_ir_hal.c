@@ -1,20 +1,25 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Nicolas Aubry
+// Copyright (C) 2026 Nicolas Aubry (original bit-bang HAL)
+// Copyright (C) 2026 @Jackv_makes (TFBS4711 adaptation)
 
 #include "gbc_ir_hal.h"
 #include "mg_timing.h"
 
 #include <furi.h>
 #include <furi_hal.h>
-#include <furi_hal_power.h>
 #include <furi_hal_cortex.h>
+#include <furi_hal_serial_control.h>
+#include <expansion/expansion.h>
 
 // The Flipper's STM32WB55 core runs at 64 MHz; DWT->CYCCNT counts CPU cycles.
 #define GBC_CPU_MHZ 64u
 
 static GbcIrConfig g_cfg;
 static bool g_inited = false;
-static bool g_otg_was_on = false;
+// Pins 13/14 are USART1; the expansion-module service owns them until we
+// take the USART for ourselves.
+static Expansion* g_expansion = NULL;
+static FuriHalSerialHandle* g_serial = NULL;
 
 // -------------------------------------------------------------------------
 // Cycle-counter helpers (DWT is already running; furi uses it for delays).
@@ -54,16 +59,18 @@ bool gbc_ir_rx_is_mark(void) {
 // Config / lifecycle
 // -------------------------------------------------------------------------
 GbcIrConfig gbc_ir_config_default(void) {
+    // FlippIR board: TFBS4711 TXD on pin 13 (PB6), RXD on pin 14 (PB7),
+    // 3.3 V from pin 9, SD tied low. TXD is active high; RXD idles high and
+    // pulses low. Pulses under 23 us come out exactly as driven, so marks are
+    // chained from 20 us pieces with 2 us gaps (verified against a US Gold
+    // cart, 2026-10-20).
     GbcIrConfig cfg = {
-        .tx_pin = &gpio_ext_pa7, // header pin 2 (also TIM1/16/17 CH -- future HW PWM)
-        .rx_pin = &gpio_ext_pc0, // header pin 16 (clean dedicated input, no key/subsystem)
-        .tx_active_high = true, // low-side NPN driver: HIGH => LED on
-        .rx_active_low = true, // inverting open-collector buffer
-        // The built board (protoboard Rev L) runs the receiver from the 5 V rail
-        // on header pin 1, so OTG must be on or the receiver is unpowered when
-        // the Flipper runs on battery. (On USB power, VBUS feeds pin 1 anyway,
-        // which can mask this if the flag is wrong.)
-        .enable_otg_5v = true,
+        .tx_pin = &gpio_usart_tx, // header pin 13
+        .rx_pin = &gpio_usart_rx, // header pin 14
+        .tx_active_high = true,
+        .rx_active_low = true,
+        .tx_max_pulse_us = 20,
+        .tx_gap_us = 2,
     };
     return cfg;
 }
@@ -72,10 +79,15 @@ void gbc_ir_init(const GbcIrConfig* cfg) {
     furi_check(cfg);
     g_cfg = *cfg;
 
-    if(g_cfg.enable_otg_5v) {
-        g_otg_was_on = furi_hal_power_is_otg_enabled();
-        if(!g_otg_was_on) {
-            furi_hal_power_enable_otg();
+    // Claim USART1 so the expansion-module service lets go of pins 13/14.
+    if(!g_serial) {
+        g_expansion = furi_record_open(RECORD_EXPANSION);
+        expansion_disable(g_expansion);
+        g_serial = furi_hal_serial_control_acquire(FuriHalSerialIdUsart);
+        if(!g_serial) {
+            expansion_enable(g_expansion);
+            furi_record_close(RECORD_EXPANSION);
+            g_expansion = NULL;
         }
     }
 
@@ -84,10 +96,8 @@ void gbc_ir_init(const GbcIrConfig* cfg) {
         g_cfg.tx_pin, GpioModeOutputPushPull, GpioPullNo, GpioSpeedVeryHigh);
     gbc_led(false);
 
-    // RX: input. Enable the internal pull toward the idle level. With an
-    // inverting open-collector buffer, idle (no IR) is HIGH, so pull up. The
-    // internal pull-up ties to 3.3 V, keeping the pin GPIO-safe even though the
-    // op-amp runs at 5 V.
+    // RX: input, pulled toward the idle level (RXD is push-pull and idles
+    // HIGH; the pull-up only matters with the board unplugged).
     furi_hal_gpio_init(
         g_cfg.rx_pin,
         GpioModeInput,
@@ -104,8 +114,14 @@ void gbc_ir_deinit(void) {
     furi_hal_gpio_init(g_cfg.tx_pin, GpioModeAnalog, GpioPullNo, GpioSpeedLow);
     furi_hal_gpio_init(g_cfg.rx_pin, GpioModeAnalog, GpioPullNo, GpioSpeedLow);
 
-    if(g_cfg.enable_otg_5v && !g_otg_was_on) {
-        furi_hal_power_disable_otg();
+    if(g_serial) {
+        furi_hal_serial_control_release(g_serial);
+        g_serial = NULL;
+    }
+    if(g_expansion) {
+        expansion_enable(g_expansion);
+        furi_record_close(RECORD_EXPANSION);
+        g_expansion = NULL;
     }
     g_inited = false;
 }
@@ -133,8 +149,33 @@ void gbc_ir_unlock(void) {
 // TX primitives
 // -------------------------------------------------------------------------
 void gbc_ir_tx_mark(uint32_t us) {
-    gbc_led(true);
-    gbc_busy_us(us);
+    if(g_cfg.tx_max_pulse_us == 0 || us <= g_cfg.tx_max_pulse_us) {
+        gbc_led(true);
+        gbc_busy_us(us);
+        return;
+    }
+    // Chain short pulses so the total mark still spans `us` (gaps included).
+    uint32_t start = gbc_cyc_now();
+    uint32_t total = us * GBC_CPU_MHZ;
+    uint32_t piece = g_cfg.tx_max_pulse_us * GBC_CPU_MHZ;
+    uint32_t gap = g_cfg.tx_gap_us * GBC_CPU_MHZ;
+    for(;;) {
+        uint32_t el = gbc_cyc_now() - start;
+        if(el >= total) break;
+        uint32_t left = total - el;
+        if(left < 2 * GBC_CPU_MHZ) break; // too short to be seen
+        gbc_led(true);
+        uint32_t t0 = gbc_cyc_now();
+        uint32_t on = (left < piece) ? left : piece;
+        while((gbc_cyc_now() - t0) < on) {
+        }
+        gbc_led(false);
+        if((gbc_cyc_now() - start) >= total) break;
+        t0 = gbc_cyc_now();
+        while((gbc_cyc_now() - t0) < gap) {
+        }
+    }
+    gbc_led(false);
 }
 
 void gbc_ir_tx_space(uint32_t us) {
